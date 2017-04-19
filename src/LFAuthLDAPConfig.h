@@ -37,6 +37,14 @@
 #include "TRArray.h"
 #include "TRConfig.h"
 
+#define DEFAULT_OATH_DIGITS_LENGTH  6
+#define DEFAULT_OATH_PEROID         30
+#define DEFAULT_OATH_TIMEOUT        3
+#define DEFAULT_OATH_CONNECT_TIMEOUT 3
+#define DEFAULT_OATH_TYPE           "TOTP"
+#define DEFAULT_OATH_ALGORITHM      "SHA1"
+#define DEFAULT_OATH_ISSUER         "OpenVPN"
+
 @interface LFAuthLDAPConfig : TRObject <TRConfigDelegate> {
 	/* LDAP Settings */
 	LFString *_url;
@@ -63,6 +71,19 @@
 	LFString *_configFileName;
 	TRConfig *_configDriver;
 	TRArray *_sectionStack;
+
+    /* OATH Settings */
+    BOOL _oathEnabled;
+    BOOL _oathSignEnabled;
+    int _oathDigitsLength;
+    int _oathPeriod;
+    int _oathTimeout;
+    int _oathConnectTimeout;
+    LFString *_oathApi;
+    LFString *_oathSecret;
+    LFString *_oathIssuer;
+    LFString *_oathType;
+    LFString *_oathAlgorithm;
 }
 
 - (id) initWithConfigFile: (const char *) fileName;
@@ -123,6 +144,39 @@
 - (void) setPFEnabled: (BOOL) newPFSetting;
 
 - (TRArray *) ldapGroups;
+
+- (BOOL) oathEnabled;
+- (void) setOathEnabled: (BOOL) enabled;
+
+- (BOOL) oathSignEnabled;
+- (void) setOathSignEnabled: (BOOL) enabled;
+
+- (int) oathDigitsLength;
+- (void) setOathDigitsLength: (int) length;
+
+- (int) oathPeriod;
+- (void) setOathPeriod: (int) period;
+
+- (int) oathTimeout;
+- (void) setOathTimeout: (int) timeout;
+
+- (int) oathConnectTimeout;
+- (void) setOathConnectTimeout: (int) timeout;
+
+- (LFString *) oathApi;
+- (void) setOathApi: (LFString *) oathApi;
+
+- (LFString *) oathSecret;
+- (void) setOathSecret: (LFString *) secret;
+
+- (LFString *) oathIssuer;
+- (void) setOathIssuer: (LFString *) issuer;
+
+- (LFString *) oathType;
+- (void) setOathType: (LFString *) type;
+
+- (LFString *) oathAlgorithm;
+- (void) setOathAlgorithm: (LFString *) algorithm;
 
 @end
 

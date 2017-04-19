@@ -347,6 +347,158 @@ AC_DEFUN([OD_OPENVPN_HEADER],[
 ])
 
 #------------------------------------------------------------------------
+# OD_OPENSSL --
+#
+#	Locate the OpenSSL libraries and headers
+#
+# Arguments:
+#	None.
+#
+# Requires:
+#	none
+#
+# Depends:
+#	none
+#
+# Results:
+#
+#	Adds a --with-openssl switch to configure.
+#	Result is cached.
+#
+#	Substitutes the following variables:
+#		OPENSSL_CFLAGS
+#		OPENSSL_LIBS
+#------------------------------------------------------------------------
+AC_DEFUN([OD_OPENSSL],[
+	AC_REQUIRE([AC_PROG_CC])
+	AC_ARG_WITH(openssl, AC_HELP_STRING([--with-openssl], [Specify the path to the OpenSSL source]), [with_openssl=${withval}])
+
+    OPENSSL_LIBS="-lssl -lcrypto"
+	if test x"${with_openssl}" = "x"; then
+		OPENSSL_LIBS="${OPENSSL_LIBS} -L${with_openssl}/lib"
+		OPENSSL_CFLAGS="${OPENSSL_CFLAGS} -I${with_openssl}/include"
+	else
+		OPENSSL_CFLAGS="-I${with_openssl}"
+	fi
+
+	# Save CFLAGS
+    OLD_LIBS="${LIBS}"
+	OLD_CFLAGS="${CFLAGS}"
+
+
+	CFLAGS="${CFLAGS} ${OPENSSL_CFLAGS}"
+    LIBS="${LIBS} ${OPENSSL_LIBS}"
+
+	AC_MSG_CHECKING([for openssl/sha.h])
+	AC_CACHE_VAL(od_cv_openssl, [
+		AC_LINK_IFELSE([
+				AC_LANG_PROGRAM([
+						#include <openssl/crypto.h>
+						#include <openssl/sha.h>
+					], [
+                        char * string = "12345678";
+                        unsigned char hash@<:@SHA256_DIGEST_LENGTH@:>@;
+                        SHA256_CTX sha256;
+                        SHA256_Init(&sha256);
+                        SHA256_Update(&sha256, string, strlen(string));
+                        SHA256_Final(hash, &sha256);
+					])
+				], [
+					# Failed
+					od_cv_openssl="yes"
+				], [
+					# Success
+					od_cv_openssl="no"
+				]
+		)
+	])
+	AC_MSG_RESULT(${od_cv_openssl})
+
+	if test x"${od_cv_openssl}" = x"no"; then
+			AC_MSG_FAILURE([Could not locate a working openssl source tree.])
+	fi
+
+	# Restore LIBS & CFLAGS
+	LIBS="${OLD_LIBS}"
+	CFLAGS="${OLD_CFLAGS}"
+
+	AC_SUBST([OPENSSL_CFLAGS])
+    AC_SUBST([OPENSSL_LIBS])
+])
+
+#------------------------------------------------------------------------
+# OD_CURL --
+#
+#	Locate the CURL libraries and headers
+#
+# Arguments:
+#	None.
+#
+# Requires:
+#	none
+#
+# Depends:
+#	none
+#
+# Results:
+#
+#	Adds a --with-curl switch to configure.
+#	Result is cached.
+#
+#	Substitutes the following variables:
+#		CURL_CFLAGS
+#------------------------------------------------------------------------
+AC_DEFUN([OD_CURL],[
+	AC_REQUIRE([AC_PROG_CC])
+	AC_ARG_WITH(curl, AC_HELP_STRING([--with-curl], [Specify the path to the CURL source]), [with_curl=${withval}])
+
+    CURL_LIBS="-lcurl"
+	if test x"${with_curl}" = "x"; then
+		CURL_LIBS="${CURL_LIBS} -L${with_curl}/lib"
+		CURL_CFLAGS="${CURL_CFLAGS} -I${with_curl}/include"
+	else
+		CURL_CFLAGS="-I${with_curl}"
+	fi
+
+	# Save CFLAGS
+    OLD_LIBS="${LIBS}"
+	OLD_CFLAGS="${CFLAGS}"
+
+	CFLAGS="${CFLAGS} ${CURL_CFLAGS}"
+    LIBS="${LIBS} ${CURL_LIBS}"
+
+	AC_MSG_CHECKING([for curl/curl.h])
+	AC_CACHE_VAL(od_cv_curl, [
+		AC_LINK_IFELSE([
+				AC_LANG_PROGRAM([
+						#include <curl/curl.h>
+					], [
+                        void *ptr = (void*) curl_easy_init;
+					])
+				], [
+					# Failed
+					od_cv_curl="yes"
+				], [
+					# Success
+					od_cv_curl="no"
+				]
+		)
+	])
+	AC_MSG_RESULT(${od_cv_curl})
+
+	if test x"${od_cv_curl}" = x"no"; then
+			AC_MSG_FAILURE([Could not locate a working curl source tree.])
+	fi
+
+	# Restore LIBS & CFLAGS
+	LIBS="${OLD_LIBS}"
+	CFLAGS="${OLD_CFLAGS}"
+
+	AC_SUBST([CURL_CFLAGS])
+    AC_SUBST([CURL_LIBS])
+])
+
+#------------------------------------------------------------------------
 # TR_PF_IOCTL --
 #
 #	Locate the pf(4) headers

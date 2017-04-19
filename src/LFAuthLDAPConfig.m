@@ -53,6 +53,7 @@ typedef enum {
 	LF_LDAP_SECTION,		/* LDAP Server Settings */
 	LF_AUTH_SECTION,		/* LDAP Authorization Settings */
 	LF_GROUP_SECTION,		/* LDAP Group Settings */
+    LF_OATH_SECTION,        /* OATH Settings */
 
 	/* Generic LDAP Search Variables */
 	LF_LDAP_BASEDN,			/* Base DN for Search */
@@ -80,6 +81,19 @@ typedef enum {
 	/* Group Section Variables */
 	LF_GROUP_MEMBER_ATTRIBUTE,	/* Group Membership Attribute */
 
+    /* OATH Variables */
+    LF_OATH,
+    LF_OATH_SIGN,
+    LF_OATH_DIGITS_LENGTH,
+    LF_OATH_PEROID,
+    LF_OATH_TIMEOUT,
+    LF_OATH_CONNECT_TIMEOUT,
+    LF_OATH_API,
+    LF_OATH_SECRET,
+    LF_OATH_ISSUER,
+    LF_OATH_TYPE,
+    LF_OATH_ALGORITHM,
+
 	/* Misc Shared */
 	LF_UNKNOWN_OPCODE,		/* Unknown Opcode */
 } ConfigOpcode;
@@ -98,6 +112,7 @@ static OpcodeTable SectionTypes[] = {
 	{ "LDAP",		LF_LDAP_SECTION, 	NO,	YES },
 	{ "Authorization",	LF_AUTH_SECTION, 	NO,	YES },
 	{ "Group",		LF_GROUP_SECTION, 	YES,	NO },
+	{ "OATH",		LF_OATH_SECTION, 	NO,	NO },
 	{ NULL, 0 }
 };
 
@@ -139,6 +154,7 @@ static OpcodeTable LDAPSectionVariables[] = {
 static OpcodeTable AuthSectionVariables[] = {
 	/* name			opcode			multi	required */
 	{ "RequireGroup",	LF_AUTH_REQUIRE_GROUP,	NO,	NO },
+    { "OATHEnable",     LF_OATH,                NO, NO },
 	{ NULL, 0}
 };
 
@@ -147,6 +163,22 @@ static OpcodeTable GroupSectionVariables[] = {
 	/* name			opcode			multi	required */
 	{ "MemberAttribute",	LF_GROUP_MEMBER_ATTRIBUTE, NO,	NO },
 	{ NULL, 0 }
+};
+
+/* OATH Section Variables */
+static OpcodeTable OathSectionVariables[] = {
+    /* name                 opcode                   multi   required */
+    { "OATHSignEnable",     LF_OATH_SIGN,            NO,     NO },
+    { "OATHDigitsLength",   LF_OATH_DIGITS_LENGTH,   NO,     NO },
+    { "OATHPeriod",         LF_OATH_PEROID,          NO,     NO },
+    { "OATHTimeout",        LF_OATH_TIMEOUT,         NO,     NO },
+    { "OATHConnectTimeout", LF_OATH_CONNECT_TIMEOUT, NO,     NO },
+    { "OATHApi",            LF_OATH_API,             NO,     YES},
+    { "OATHSecret",         LF_OATH_SECRET,          NO,     YES},
+    { "OATHIssuer",         LF_OATH_ISSUER,          NO,     NO },
+    { "OATHType",           LF_OATH_TYPE,            NO,     NO },
+    { "OATHAlgorithm",      LF_OATH_ALGORITHM,       NO,     NO },
+	{ NULL, 0}
 };
 
 /* Section Types */
@@ -175,6 +207,11 @@ static OpcodeTable *GroupSection[] = {
 	GenericLDAPVariables,
 	GenericPFVariables,
 	NULL
+};
+
+static OpcodeTable *OathSection[] = {
+    OathSectionVariables,
+    NULL
 };
 
 /* Parse a string, returning the associated entry from the supplied table */
@@ -297,6 +334,17 @@ static const char *string_for_opcode(ConfigOpcode opcode, OpcodeTable *tables[])
 		[_ldapGroups release];
 	if (_pfTable)
 		[_pfTable release];
+
+    if (_oathApi)
+        [_oathApi release];
+    if (_oathSecret)
+        [_oathSecret release];
+    if (_oathIssuer)
+        [_oathIssuer release];
+    if (_oathType)
+        [_oathType release];
+    if (_oathAlgorithm)
+        [_oathAlgorithm release];
 
 	[super dealloc];
 }
@@ -538,6 +586,9 @@ error:
 					/* Let the SectionContext own groupConfig */
 					[groupConfig release];
 					break;
+                case LF_OATH_SECTION:
+					[self pushSection: opcodeEntry->opcode];
+                    break;
 				default:
 					[self errorUnknownSection: sectionType];
 					return;
@@ -659,6 +710,7 @@ error:
 
 			switch(opcodeEntry->opcode) {
 				BOOL requireGroup;
+                BOOL oathEnabled;
 
 				case LF_AUTH_REQUIRE_GROUP:
 					if (![value boolValue: &requireGroup]) {
@@ -679,6 +731,14 @@ error:
 				case LF_AUTH_PFTABLE:
 					[self setPFTable: [value string]];
 					[self setPFEnabled: YES];
+					break;
+                
+                case LF_OATH:
+					if (![value boolValue: &oathEnabled]) {
+						[self errorBoolValue: value];
+						return;
+					}
+					[self setOathEnabled: oathEnabled];
 					break;
 
 				/* Unknown Setting */
@@ -721,6 +781,92 @@ error:
 				/* Unknown Setting */
 				default:
 					[self errorUnknownKey: key];
+			}
+			break;
+
+		case LF_OATH_SECTION:
+			opcodeEntry = parse_opcode(key, OathSection);
+			if (!opcodeEntry) {
+				[self errorUnknownKey: key];
+				return;
+			}
+
+			switch(opcodeEntry->opcode) {
+				int digitsLength;
+                int period;
+                int timeout;
+                BOOL enabled;
+                
+                case LF_OATH_SIGN:
+					if (![value boolValue: &enabled]) {
+						[self errorBoolValue: value];
+						return;
+					}
+					[self setOathSignEnabled: enabled];
+					break;
+
+				case LF_OATH_DIGITS_LENGTH:
+					if (![value intValue: &digitsLength]) {
+						[self errorIntValue: value];
+						return;
+					}
+                    if(digitsLength < DEFAULT_OATH_DIGITS_LENGTH) {
+                        [TRLog error: "Auth-LDAP Configuration Error: %s must greater than or equals to %d (%s:%u).", 
+                            [value cString], DEFAULT_OATH_DIGITS_LENGTH, [_configFileName cString], [value lineNumber]];
+                        [_configDriver errorStop];
+                        return;
+                    }
+					[self setOathDigitsLength: digitsLength];
+					break;
+
+				case LF_OATH_PEROID:
+					if (![value intValue: &period]) {
+						[self errorIntValue: value];
+						return;
+					}
+					[self setOathPeriod: period];
+					break;
+
+				case LF_OATH_TIMEOUT:
+					if (![value intValue: &timeout]) {
+						[self errorIntValue: value];
+						return;
+					}
+					[self setOathTimeout: timeout];
+					break;
+
+				case LF_OATH_CONNECT_TIMEOUT:
+					if (![value intValue: &timeout]) {
+						[self errorIntValue: value];
+						return;
+					}
+					[self setOathConnectTimeout: timeout];
+					break;
+
+				case LF_OATH_API:
+					[self setOathApi: [value string]];
+					break;
+
+				case LF_OATH_SECRET:
+					[self setOathSecret: [value string]];
+					break;
+
+				case LF_OATH_ISSUER:
+					[self setOathIssuer: [value string]];
+					break;
+
+				case LF_OATH_TYPE:
+					[self setOathType: [value string]];
+					break;
+
+				case LF_OATH_ALGORITHM:
+					[self setOathAlgorithm: [value string]];
+					break;
+
+				/* Unknown Setting */
+				default:
+					[self errorUnknownKey: key];
+					return;
 			}
 			break;
 		default:
@@ -767,6 +913,9 @@ error:
 				break;
 			[_ldapGroups addObject: [self currentSectionContext]];
 			break;
+        case LF_OATH_SECTION:
+			[self validateRequiredVariables: OathSection withSectionEnd: sectionEnd];
+            break;
 		default:
 			/* Must be unreachable! */
 			[TRLog error: "Unhandled section type in endSection!\n"];
@@ -942,6 +1091,104 @@ error:
 
 - (TRArray *) ldapGroups {
 	return _ldapGroups;
+}
+
+- (BOOL) oathEnabled {
+    return (_oathEnabled);
+}
+
+- (void) setOathEnabled: (BOOL) enabled {
+    _oathEnabled = enabled;
+}
+
+- (BOOL) oathSignEnabled {
+    return (_oathSignEnabled);
+}
+
+- (void) setOathSignEnabled: (BOOL) enabled {
+    _oathSignEnabled = enabled;
+}
+
+- (int) oathDigitsLength {
+    return (_oathDigitsLength);
+}
+
+- (void) setOathDigitsLength: (int) length {
+    _oathDigitsLength = length;
+}
+
+- (int) oathPeriod {
+    return (_oathPeriod);
+}
+
+- (void) setOathPeriod: (int) period {
+    _oathPeriod = period;
+}
+
+- (int) oathTimeout {
+    return (_oathTimeout);
+}
+
+- (void) setOathTimeout: (int) timeout {
+    _oathTimeout = timeout;
+}
+
+- (int) oathConnectTimeout{
+    return (_oathConnectTimeout);
+}
+
+- (void) setOathConnectTimeout: (int) timeout {
+    _oathConnectTimeout = timeout;
+}
+
+- (LFString *) oathApi {
+    return (_oathApi);
+}
+
+- (void) setOathApi: (LFString *) oathApi {
+    if (_oathApi) 
+        [_oathApi release];
+    _oathApi = [oathApi retain];
+}
+
+- (LFString *) oathSecret {
+    return (_oathSecret);
+}
+
+- (void) setOathSecret: (LFString *) secret {
+    if (_oathSecret)
+        [_oathSecret release];
+    _oathSecret = [secret retain];
+}
+
+- (LFString *) oathIssuer {
+    return (_oathIssuer);
+}
+
+- (void) setOathIssuer: (LFString *) issuer {
+    if (_oathIssuer)
+        [_oathIssuer release];
+    _oathIssuer = [issuer retain];
+}
+
+- (LFString *) oathType {
+    return (_oathType);
+}
+
+- (void) setOathType: (LFString *) type {
+    if (_oathType)
+        [_oathType release];
+    _oathType = [type retain];
+}
+
+- (LFString *) oathAlgorithm {
+    return (_oathAlgorithm);
+}
+
+- (void) setOathAlgorithm: (LFString *) algorithm {
+    if (_oathAlgorithm)
+        [_oathAlgorithm release];
+    _oathAlgorithm = [algorithm retain];
 }
 
 @end

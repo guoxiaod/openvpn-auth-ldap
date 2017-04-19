@@ -37,6 +37,11 @@
 #include <errno.h>
 
 #include <ldap.h>
+#include <ctype.h>
+#include <curl/curl.h>
+
+#include "openssl/crypto.h"  
+#include "openssl/sha.h"  
 
 #include <openvpn-plugin.h>
 
@@ -48,6 +53,9 @@
 #include <TRPacketFilter.h>
 #include <TRPFAddress.h>
 #include <TRLog.h>
+
+#define MAX_CURL_RESULT_LENGTH 256
+#define MAX_API_PARAMS_COUNT 16
 
 /* Plugin Context */
 typedef struct ldap_ctx {
@@ -84,6 +92,15 @@ char *xstrdup(const char *str) {
 	ptr = strdup(str);
 	if (!ptr)
 		err(1, "strdup returned NULL");
+
+	return (ptr);
+}
+
+char *xstrndup(const char *str, size_t len) {
+	void *ptr;
+	ptr = strndup(str, len);
+	if (!ptr)
+		err(1, "strndup returned NULL");
 
 	return (ptr);
 }
@@ -445,6 +462,270 @@ static TRLDAPGroupConfig *find_ldap_group(LFLDAPConnection *ldap, LFAuthLDAPConf
 	return result;
 }
 
+
+static char hexchars[] = "0123456789abcdef";
+static char * urlencode(const char *str) {
+    char * result = malloc(strlen(str) * 3 + 1);
+    char * p = result;
+    while (*str) {
+        if (isalnum(*str) || *str == '-' || *str == '_' || *str == '.' || *str == '~') {
+            *p ++ = *str;
+        } else if (*str == ' ') {
+            *p ++ = '+';
+        } else {
+            *p ++ = '%';
+            *p ++ = hexchars[(*str >> 4) & 0xff];
+            *p ++ = hexchars[*str & 0xff];
+        }
+        str ++;
+    }
+    *p = '\0';
+    return result;
+}
+
+static char * urldecode(const char *str) {
+    char * result = malloc(strlen(str) + 1);
+    char * p = result;
+    while (*str) {
+        if (*str == '%') {
+            if (str[1] && str[2]) {
+                *p = (isdigit(str[1]) ? (str[1] - '0') : (tolower(str[1]) - 'a' + 10)) << 4;
+                *p = isdigit(str[2]) ? (str[2] - '0') : (tolower(str[2]) - 'a' + 10);
+                str += 2;
+                p ++;
+            }
+        } else if (*str == '+') { 
+            *p ++ = ' ';
+        } else {
+            *p ++ = *str;
+        }
+        str ++;
+    }
+    *p = '\0';
+    return result;
+}
+
+static int str_cmp(const void * a, const void * b) {
+    return strcmp((char*) a, (char*) b);
+}
+
+static char * compute_sign(const char * url, const char * secret, const char * username,
+        const char * algorithm, const char * digits, const char * issuer, const char * type,
+        const char * extra, const int period, const time_t now, char * sign) {
+
+    int i, count;
+    char * extra2, ** keys, *p;
+    char buffer[4096], tmp[4096], timestr[32] = {0};
+
+    snprintf(timestr, sizeof(timestr), "%ld", now);
+    if(extra == NULL) {
+        snprintf(buffer, sizeof(buffer), "%saccount=%s&algorithm=%s&digits=%s&issuer=%s&period=%d&type=%s%s",
+                secret, username, algorithm, digits, issuer, period, type, timestr);
+    } else {
+        extra2 = urldecode(extra);
+        snprintf(tmp, sizeof(tmp), "account=%s&algorithm=%s&digits=%s&issuer=%s&period=%d&type=%s&%s",
+                username, algorithm, digits, issuer, period, type, extra2);
+        free(extra2);
+
+        keys = (char **) malloc(MAX_API_PARAMS_COUNT * sizeof(char*));
+        if (keys == NULL) {
+            [TRLog error: "Cannot allocate %d memory for keys - OpenVPN LDAP Plugin", MAX_API_PARAMS_COUNT * sizeof(char*)];
+            return NULL;
+        }
+
+        i = 1;
+        p = *keys = tmp;
+        while (* ++p) {
+            if (*(p - 1) == '&') {
+                *(keys + i ++) = p;
+                *(p - 1) = '\0';
+            }
+        }
+        count = i;
+        qsort(keys, count, sizeof(char*), str_cmp);
+        memset(buffer, 0, sizeof(buffer));
+        strcat(buffer, secret);
+        for(i = 0; i < count; i ++) {
+            if(i > 0) {
+                strcat(buffer, "&");
+            }
+            strcat(buffer, keys[i]);
+        }
+        strcat(buffer, timestr);
+
+        if(keys) {
+            free(keys);
+            keys = NULL;
+        }
+    }
+
+    [TRLog debug: "String to be signed is '%s' - OpenVPN LDAP Plugin", buffer];
+
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+    SHA256_Update(&sha256, buffer, strlen(buffer));
+    SHA256_Final(hash, &sha256);
+
+    for (i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(sign + (i * 2), "%02x", hash[i]);
+    }
+    sign[64] = '\0';
+    strcat(sign, timestr);
+
+    [TRLog debug: "String after signed is '%s' - OpenVPN LDAP Plugin", sign];
+
+    return sign;
+}
+
+static size_t write_data(void * buffer, size_t size, size_t nmemb, void * userdata) {
+    size_t realsize;
+
+    realsize = size * nmemb;
+    realsize = realsize >= MAX_CURL_RESULT_LENGTH ? MAX_CURL_RESULT_LENGTH - 1 : realsize;
+    memcpy(userdata, buffer, realsize);
+
+    return realsize;
+}
+
+static bool generate_url(LFAuthLDAPConfig * config,
+        const char * username, const char * digits, char *result, size_t len) {
+    int period;
+    BOOL signEnabled;
+    const LFString *sApi, *sSecret, *sType, *sAlgorithm, *sIssuer;
+    const char *api, *secret, *type, *algorithm, *issuer;
+    char *username2, *algorithm2, *issuer2, *type2;
+    char *url, *extra, sign[100] = {0};
+    time_t now;
+
+    sApi = [config oathApi];
+    sSecret = [config oathSecret];
+
+    sIssuer = [config oathIssuer];
+    sType = [config oathType];
+    sAlgorithm = [config oathAlgorithm];
+
+    period = [config oathPeriod];
+    signEnabled = [config oathSignEnabled];
+
+    period = period > 0 ? period : DEFAULT_OATH_PEROID;
+
+    api = [sApi cString];
+    secret = [sSecret cString];
+    issuer = sIssuer == NULL ? DEFAULT_OATH_ISSUER : [sIssuer cString];
+    type = sType == NULL ? DEFAULT_OATH_TYPE : [sType cString];
+    algorithm = sAlgorithm == NULL ? DEFAULT_OATH_ALGORITHM : [sAlgorithm cString];
+
+    username2 = urlencode(username);
+    algorithm2 = urlencode(algorithm);
+    issuer2 = urlencode(issuer);
+    type2 = urlencode(type);
+
+    url = xstrdup(api);
+    extra = strchr(url, '?');
+    if (extra != NULL) {
+        * extra ++ = '\0';
+    }
+    if (extra != NULL && *extra == '\0') {
+        extra = NULL; 
+    }
+
+    now = time(NULL);
+    if (signEnabled){
+        compute_sign(url, secret, username, algorithm, digits, issuer, type, extra, period, now, sign);
+    }
+
+    // account=xxxx
+    // algorithm=sha1
+    // digits=123456
+    // issuer=xxxxxx
+    // period=30
+    // type=totp
+    //
+    // sign=xxxx
+    snprintf(result, len, "%s%caccount=%s&algorithm=%s&digits=%s&issuer=%s&period=%d&type=%s&sign=%s%s%s",
+            url, '?', username2, algorithm2, digits, issuer2, period,
+            type2, strlen(sign) ? sign : "", extra ? "&" : "", extra ? extra : "");
+
+    if(username2) free(username2);
+    if(algorithm2) free(algorithm2);
+    if(issuer2) free(issuer2);
+    if(type2) free(type2);
+
+    return true;
+}
+
+static bool is_digits(const char * digits) {
+    size_t i, len = strlen(digits);
+    for(i = 0; i < len; i ++) {
+        if (digits[i] < '0' || digits[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int handle_auth_user_oath_verify(LFAuthLDAPConfig *config, const char * username, const char * digits) {
+    long code;
+    CURLcode res;
+    int timeout, connectTimeout, digitsLength, ret;
+    char buffer[4096] = {0}, result[MAX_CURL_RESULT_LENGTH] = {0};
+
+    digitsLength = [config oathDigitsLength];
+    digitsLength = digitsLength < DEFAULT_OATH_DIGITS_LENGTH ? DEFAULT_OATH_DIGITS_LENGTH : digitsLength;
+
+    if (!is_digits(digits)) {
+        [TRLog debug: "Incorrect remote password - OpenVPN LDAP Plugin (OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY)."];
+        return (OPENVPN_PLUGIN_FUNC_ERROR);
+    }
+
+    timeout = [config oathTimeout];
+    connectTimeout = [config oathConnectTimeout];
+
+    timeout = timeout > 0 ? timeout : DEFAULT_OATH_TIMEOUT;
+    connectTimeout = connectTimeout > 0 ? connectTimeout : DEFAULT_OATH_CONNECT_TIMEOUT;
+
+    if (!generate_url(config, username, digits, buffer, sizeof(buffer))) {
+        [TRLog error: "Generate url failed - OpenVPN LDAP Plugin (OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY)."];
+        return OPENVPN_PLUGIN_FUNC_ERROR;
+    }
+
+    CURL *curl = curl_easy_init();
+    if (curl == NULL) {
+        [TRLog error: "Init curl failed - OpenVPN LDAP Plugin (OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY)."];
+        return OPENVPN_PLUGIN_FUNC_ERROR;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, buffer);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);   
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);   
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "openvpn-" PACKAGE_NAME "/" PACKAGE_VERSION);
+    res = curl_easy_perform(curl);
+    ret = OPENVPN_PLUGIN_FUNC_SUCCESS;
+    if(res != CURLE_OK) {
+        [TRLog error: "Request %s failed, and return %d - OpenVPN LDAP Plugin "
+            "(OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY).", buffer, res];
+        ret = OPENVPN_PLUGIN_FUNC_ERROR;
+    } else if (curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code) == CURLE_OK) {    
+        if(strncmp(result, "true", sizeof("true") - 1) == 0) {
+            ret = OPENVPN_PLUGIN_FUNC_SUCCESS;
+        } else {
+            [TRLog error: "Request %s success, response code is %d, result is '%s' - OpenVPN LDAP Plugin "
+                "(OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY).", buffer, code, result];
+            ret = OPENVPN_PLUGIN_FUNC_ERROR;
+        }
+    } else {
+        [TRLog error: "Request %s success, but get response code failed - OpenVPN LDAP Plugin "
+            "(OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY).", buffer];
+        ret = OPENVPN_PLUGIN_FUNC_ERROR;
+    }
+    curl_easy_cleanup(curl);
+
+    return ret;
+}
+
 /*! Handle user authentication. */
 static int handle_auth_user_pass_verify(ldap_ctx *ctx, LFLDAPConnection *ldap, TRLDAPEntry *ldapUser, const char *password) {
 	TRLDAPGroupConfig *groupConfig;
@@ -544,6 +825,8 @@ static int handle_client_connect_disconnect(ldap_ctx *ctx, LFLDAPConnection *lda
 
 OPENVPN_EXPORT int
 openvpn_plugin_func_v1(openvpn_plugin_handle_t handle, const int type, const char *argv[], const char *envp[]) {
+    size_t digitsLength, passwordLength;
+    char *digits, *realPassword;
 	const char *username, *password, *remoteAddress;
 	ldap_ctx *ctx = handle;
 	LFLDAPConnection *ldap = nil;
@@ -578,12 +861,34 @@ openvpn_plugin_func_v1(openvpn_plugin_handle_t handle, const int type, const cha
 	switch (type) {
 		/* Password Authentication */
 		case OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY:
-			if (!password) {
+            digits = NULL;
+            realPassword = password;
+            if (password && [ctx->config oathEnabled]) {
+                digitsLength = [ctx->config oathDigitsLength];
+                digitsLength = digitsLength < DEFAULT_OATH_DIGITS_LENGTH ? DEFAULT_OATH_DIGITS_LENGTH : digitsLength;
+                passwordLength = strlen(password);
+                if (passwordLength <= digitsLength) {
+                    [TRLog debug: "Remote password is too simple to OpenVPN LDAP Plugin (OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY)."];
+                    ret = OPENVPN_PLUGIN_FUNC_ERROR;
+                    break;
+                }
+                digits = password + passwordLength - digitsLength;
+                realPassword = xstrndup(password, passwordLength - digitsLength);
+            }
+			if (!realPassword) {
 				[TRLog debug: "No remote password supplied to OpenVPN LDAP Plugin (OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY)."];
 				ret = OPENVPN_PLUGIN_FUNC_ERROR;
 			} else {
-				ret = handle_auth_user_pass_verify(ctx, ldap, ldapUser, password);
+				ret = handle_auth_user_pass_verify(ctx, ldap, ldapUser, realPassword);
 			}
+
+            if (ret == OPENVPN_PLUGIN_FUNC_SUCCESS && digits) {
+                ret = handle_auth_user_oath_verify(ctx->config, username, digits); 
+            }
+
+            if (realPassword != password) {
+                free(realPassword);
+            }
 			break;
 		/* New connection established */
 		case OPENVPN_PLUGIN_CLIENT_CONNECT:
